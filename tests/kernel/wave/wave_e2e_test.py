@@ -1562,6 +1562,99 @@ def test_igemm_conv(
 
 @require_e2e
 @pytest.mark.parametrize(
+    "shape",
+    [(2, 3, 2, 1), (1, 4, 4, 2), (1, 7, 5, 3)],
+)
+def test_spatial_dim_flip(shape, request) -> None:
+    run_bench = request.config.getoption("--runperf")
+    # define symbols
+    N = tkl.sym.N
+    H = tkl.sym.H
+    W = tkl.sym.W
+    C = tkl.sym.C
+    H_FLIP = tkl.sym.H_FLIP
+    W_FLIP = tkl.sym.W_FLIP
+    ADDRESS_SPACE = tkl.sym.ADDRESS_SPACE
+
+    # base threads per wave
+    wave_size = 64
+    constraints = [
+        tkw.HardwareConstraint(
+            threads_per_wave=wave_size,
+            waves_per_block=(1, 1, 1),
+            vector_shapes={N: 1, H: 1, W: 1, C: 1},
+        ),
+        # work group dims
+        tkw.WorkgroupConstraint(N, 1, 0),
+        tkw.WorkgroupConstraint(H, 1, 1),
+        tkw.WorkgroupConstraint(W, 1, 2),
+        tkw.WaveConstraint(N, 1),
+        tkw.WaveConstraint(H, 1),
+        tkw.WaveConstraint(W, 1),
+    ]
+
+    i = tkw.IndexMapping.iterator(0)
+    j = tkw.IndexMapping.iterator(1)
+    k = tkw.IndexMapping.iterator(2)
+    l = tkw.IndexMapping.iterator(3)
+
+    mapping = tkw.IndexMapping(
+        num_iterators=4,
+        inputs={N: i, H: j, W: k, C: l},
+        outputs={
+            N: i,
+            H_FLIP: H - 1 - j,
+            W_FLIP: W - 1 - k,
+            C: l,
+        },
+    )
+
+    @tkw.wave(constraints)
+    def dim_flip_kernel(
+        x: tkl.Memory[N, H, W, C, ADDRESS_SPACE, tkl.f16],
+        out: tkl.Memory[N, H_FLIP, W_FLIP, C, ADDRESS_SPACE, tkl.f16],
+    ):
+        val = tkw.read(x)
+        tkw.write(val, out, mapping=mapping)
+
+    (
+        n,
+        h,
+        w,
+        c,
+    ) = shape
+    x = device_randn((n, h, w, c), dtype=torch.float16)
+    out_ref = torch.zeros((n, h, w, c), dtype=torch.float16, device=x.device)
+
+    for ni in range(n):
+        for hi in range(h):
+            for wi in range(w):
+                for ci in range(c):
+                    out_ref[ni, hi, wi, ci] = x[ni, h - 1 - hi, w - 1 - wi, ci]
+
+    out = torch.zeros_like(out_ref)
+    options = WaveCompileOptions(
+        subs={
+            N: n,
+            H: h,
+            W: w,
+            C: c,
+            H_FLIP: h,
+            W_FLIP: w,
+            ADDRESS_SPACE: tkl.AddressSpace.GLOBAL_MEMORY.value,
+        },
+        canonicalize=True,
+        run_bench=run_bench,
+        wave_runtime=True,
+    )
+    options = set_default_run_config(options)
+    compiled = wave_compile(options, dim_flip_kernel)
+    compiled(x, out)
+    assert_close(out, out_ref)
+
+
+@require_e2e
+@pytest.mark.parametrize(
     "shape, stride_h, stride_w",
     [
         ((2, 3, 2, 1), 3, 1),
@@ -1625,7 +1718,6 @@ def test_preprocessing_insert_slice_interleave(shape, stride_h, stride_w, reques
         stride_w: tkl.i32,
     ):
         val = tkw.read(x)
-        print(stride_h)
         tkw.set_symbol(STRIDE_H, stride_h)
         tkw.set_symbol(STRIDE_W, stride_w)
         tkw.write(val, out, mapping=mapping)
