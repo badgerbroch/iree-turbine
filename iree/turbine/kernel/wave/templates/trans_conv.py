@@ -45,7 +45,7 @@ def get_transponse_conv2d(
     conv_stride: int,
     input_dtype: DataType,
     output_dtype: DataType,
-    mem_space: tkl.IndexSymbol = GLOBAL_ADDRESS_SPACE,
+    mem_space: tkl.IndexSymbol = SHARED_ADDRESS_SPACE,
     block_m: Optional[int] = None,
     block_n: Optional[int] = None,
     block_k: Optional[int] = None,
@@ -99,8 +99,8 @@ def get_transponse_conv2d(
 
 
     # This includes the new size of the input matrix after the 0 vector insert, weight (filter) stays same dim
-    H_UP = H * STRIDE_H
-    W_UP = W * STRIDE_W
+    H_UP = H * slice_stride_h
+    W_UP = W * slice_stride_w
     H_OUT_CONV = (H * slice_stride_h + 2 * padding - HF) // conv_stride + 1
     W_OUT_CONV = (W * slice_stride_w + 2 * padding - WF) // conv_stride + 1
     # H_OUT_CONV = (H - 1) * STRIDE_H + HF
@@ -137,8 +137,8 @@ def get_transponse_conv2d(
         inputs={
             N: i // SZ_OUT,
             C: j % C,
-            H_OUT_CONV: ((i % SZ_OUT) % W_OUT_CONV * conv_stride + (j // C) % WF), #* STRIDE_H,
-            W_OUT_CONV: ((i % SZ_OUT) // W_OUT_CONV * conv_stride + (j // C) // WF), #* STRIDE_W,
+            H_UP: ((i % SZ_OUT) % W_OUT_CONV * conv_stride + (j // C) % WF),
+            W_UP: ((i % SZ_OUT) // W_OUT_CONV * conv_stride + (j // C) // WF),
         },
         outputs={M: i, K: j},
     )
@@ -147,8 +147,8 @@ def get_transponse_conv2d(
         num_iterators=2,
         inputs={NF: i % NF, 
                 C: j % C, 
-                HF: H - 1 - ((j // C) // WF), # flip HF and WF and ordering
-                WF: W - 1 - (j // C) % WF},
+                HF: H - 1 - ((j // C) // WF), # flip HF ordering
+                WF: W - 1 - (j // C) % WF}, # flip WF ordering
         outputs={NF: i, K: j},
     )
 
@@ -158,8 +158,8 @@ def get_transponse_conv2d(
         outputs={
             N: i // SZ_OUT,
             NF: j,
-            H_OUT_CONV: ((i % SZ_OUT) % W_OUT_CONV) * STRIDE_H,
-            W_OUT_CONV: (i % SZ_OUT) // W_OUT_CONV * STRIDE_W,
+            H_OUT_CONV: ((i % SZ_OUT) % W_OUT_CONV),
+            W_OUT_CONV: (i % SZ_OUT) // W_OUT_CONV,
         },
     )
 
@@ -196,11 +196,12 @@ def get_transponse_conv2d(
     if ratio_n is None:
         ratio_n = 1
 
-
+    # Have shape as M but for upsampling part I want shape as M0 distrubited on block_m
     constraints: list[tkw.Constraint] = []
     constraints += [tkw.WorkgroupConstraint(M0, BLOCK_M, 1)]
+    constraints += [tkw.WorkgroupConstraint(M, BLOCK_M, 1, primary=False)]
     constraints += [tkw.WorkgroupConstraint(NF, BLOCK_N, 0)]
-    constraints += [tkw.WaveConstraint(M0, BLOCK_M / ratio_m)]
+    constraints += [tkw.WaveConstraint(M, BLOCK_M / ratio_m)]
     constraints += [tkw.WaveConstraint(NF, BLOCK_N / ratio_n)]
     constraints += [tkw.TilingConstraint(K, BLOCK_K)]
 
@@ -208,7 +209,7 @@ def get_transponse_conv2d(
         tkw.HardwareConstraint(
             threads_per_wave=64,
             waves_per_block=(ratio_n, ratio_m, 1),
-            vector_shapes={N: 16, H: 16, W: 16, C: 16} # H_OUT_UPSAMP: 1, W_OUT_UPSAMP: 1, H_FLIP: 1, W_FLIP: 1},
+            vector_shapes={N: 1, H: 1, W: 1, C: 1}
         )
     ]
 
@@ -223,19 +224,21 @@ def get_transponse_conv2d(
         tkw.set_symbol(STRIDE_H, slice_stride_h)
         tkw.set_symbol(STRIDE_W, slice_stride_w)
         # need to use memory to store x
-        # can intermediate results to val and use breakpoint 
-        x_up_zeros_reg = tkl.Register[M0, N, input_dtype](0.0)
-        # Allocate memory with 0's
-        shape = (M0, N)
+        #shape = (M0, N)
         shape = (N, C, H_UP, W_UP)
+        x_up_zeros_reg = tkl.Register[M0, N, input_dtype](0.0)
+
+        # Allocate memory with 0's
         x_up_zeros = allocate(shape, distributed_shape=(BLOCK_M, BLOCK_N), dtype=input_dtype, address_space=mem_space)
         # write 0 reg to memory
         tkw.write(x_up_zeros_reg, x_up_zeros)
         # read input matrix
         x_input = tkw.read(x_raw)
+
         # Use index mapping to map orginal matrix to upsampled matrix
         tkw.write(x_input, x_up_zeros, elements_per_thread=ELEMS_PER_THREAD, mapping=upsamp_mapping)
 
+        # reduction register
         c_reg = tkl.Register[M, NF, output_dtype](0.0)
 
         @tkw.iterate(K, init_args=[c_reg])
@@ -303,8 +306,8 @@ def upsample_with_zeros(x, stride_h, stride_w):
 import torch.nn.functional as F
 
 if __name__ == "__main__":
-    n, h, w, c = 1, 4, 5, 1
-    nf, hf, wf, cf = 1, 3, 3, 1
+    n, h, w, c = 1, 2, 2, 1
+    nf, hf, wf, cf = 1, 2, 2, 1
     slice_stride_h, slice_stride_w = 1, 1
     padding = 0
     output_padding = 0
@@ -318,22 +321,10 @@ if __name__ == "__main__":
     we_flipped = torch.flip(we, dims=[2, 3])
     # out_ref = torch.nn.Conv2d(x_up, we_flipped, padding=padding)
     convRef = torch.nn.Conv2d(c, nf, hf, stride=1, padding=padding, bias=False)
-    convRef.weight = torch.nn.Parameter(we_flipped)
+    convRef.weight = torch.nn.Parameter(we)
     out_ref = convRef(x_up).detach().to(torch.float32)
 
-    # Print results
-    print("Input (x):")
-    print(x[0, 0])
-    print("\nUpsampled Input:")
-    print(x_up[0, 0])
-    print("\nWeight:")
-    print(we[0, 0])
-    print("\nWeight (flipped):")
-    print(we_flipped[0, 0])
- 
-    print("\nManual Transposed Convolution Output:")
-    print(out_ref)
-    print(out_ref.shape)
+
     layout = "nchw_fchw" 
     #layout = "nhwc_hwcf"
 
@@ -346,7 +337,7 @@ if __name__ == "__main__":
     else:
         raise ValueError(f"Invalid layout: {layout}")
     # Get compiled IREE kernel
-    trans_conv, hyperparams = get_transponse_conv2d(
+    conv, hyperparams = get_transponse_conv2d(
         layout=layout,
         n=n,
         h=h,
@@ -368,11 +359,25 @@ if __name__ == "__main__":
         wave_runtime=True,
     )
     options = set_default_run_config(options)
-    trans_conv = wave_compile(options, trans_conv)
+    conv = wave_compile(options, conv)
 
     out = torch.zeros_like(out_ref)
-    trans_conv(x, we, slice_stride_h, slice_stride_w, out)
-    # put breakpoint here after doing write in kernel to see what the value is
+    conv(x, we, slice_stride_h, slice_stride_w, out)
+
+    # Print results
+    print("Input (x):")
+    print(x[0, 0])
+    if slice_stride_h > 1 or slice_stride_w > 1:
+        print("\nUpsampled Input:")
+        print(x_up[0, 0])
+    print("\nWeight:")
+    print(we[0, 0])
+    print("\nWeight (flipped):")
+    print(we_flipped[0, 0])
+ 
+    print("\nManual Transposed Convolution Output:")
+    print(out_ref)
+    print(out_ref.shape)
     print(f"\nWave Result:\n{out}")
     print(out.shape)
 

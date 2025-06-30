@@ -37,7 +37,8 @@ from ...compiler.vector_codegen import (
     cast_vector,
 )
 
-from ...ops.wave_ops import get_custom, read, write, CustomOp
+from ...ops.wave_ops import Placeholder, get_custom, read, write, CustomOp
+from iree.turbine.kernel.wave.utils.graph_utils import get_outer_node
 
 from ..utils.general_utils import get_fastest_index, infer_dim
 from ..utils.symbol_utils import safe_subs, subs_idxc
@@ -233,10 +234,14 @@ def _construct_gather_scatter_indices(
         ), f"Dynamic val shape must be {[1]} or {[elements_per_thread]} but got {shape}"
         if shape[0] > 1:
             need_dynamic_offsets = True
-
     offsets = []
     if memory.type.address_space == SHARED_ADDRESS_SPACE:
-        symbolic_shape = memory.distributed_shape
+        if isinstance(memory, Placeholder):
+            outer_node = get_custom(get_outer_node(memory.fx_node))
+            symbolic_shape = outer_node.distributed_shape  
+        if not symbolic_shape:
+            symbolic_shape = memory.distributed_shape
+
     strides = strides_from_symbolic_shape(idxc, symbolic_shape, allow_mixed_shapes=True)
     start_indices_offset = _compute_offset(start_indices, strides)
     for i in range(elements_per_thread):
@@ -464,7 +469,11 @@ def _create_vec_read_write(
         zero = arith_d.constant(element_type, zero)
 
     if memory.type.address_space == SHARED_ADDRESS_SPACE:
-        symbolic_shape = memory.distributed_shape
+        if isinstance(memory, Placeholder):
+            outer_node = get_custom(get_outer_node(memory.fx_node))
+            symbolic_shape = outer_node.distributed_shape  
+        if not symbolic_shape:
+            symbolic_shape = memory.distributed_shape
     strides = strides_from_symbolic_shape(
         IndexingContext.current(), symbolic_shape, allow_mixed_shapes=True
     )
