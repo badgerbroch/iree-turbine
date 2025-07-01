@@ -179,7 +179,7 @@ def resolve_scaled_indices(trace):
             if not is_scaled_dim(dim_expr):
                 continue
             dim, scale_type, scale_factor = get_scale_from_dim(dim_expr)
-            if scale_type == ScalingType.DIVIDE:
+            if scale_type == ScalingType.DIVIDE or ScalingType.MULTIPLY:
                 # Index can be shared between multiple users, so we copy before modifying.
                 dim_index = deepcopy(source.index[dim])
                 assert (
@@ -204,6 +204,12 @@ def resolve_scaled_indices(trace):
                     )
                     assert scaled_elem_per_thread != 0
                     custom.update_arg("elements_per_thread", scaled_elem_per_thread)
+            # elif scale_type == ScalingType.MULTIPLY:
+            #     ...
+            #     # Need to implement multiplication scaled indices
+            #     raise NotImplementedError(
+            #         "Currently only handle case of scaled index where scaling is division."
+            #     )
             else:
                 raise NotImplementedError(
                     "Currently only handle case of scaled index where scaling is division."

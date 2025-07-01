@@ -147,8 +147,8 @@ def get_transponse_conv2d(
         num_iterators=2,
         inputs={NF: i % NF, 
                 C: j % C, 
-                HF: H - 1 - ((j // C) // WF), # flip HF ordering
-                WF: W - 1 - (j // C) % WF}, # flip WF ordering
+                HF: HF - 1 - ((j // C) // WF), # flip HF ordering
+                WF: WF - 1 - (j // C) % WF}, # flip WF ordering
         outputs={NF: i, K: j},
     )
 
@@ -182,19 +182,19 @@ def get_transponse_conv2d(
         raise ValueError(f"Unsupported layout: {layout}")
     
     if block_m is None:
-        block_m = 16
+        block_m = 64
 
     if block_n is None:
-        block_n = 16
+        block_n = 128
 
     if block_k is None:
-        block_k = 16
+        block_k = 32
 
     if ratio_m is None:
-        ratio_m = 1
+        ratio_m = 2
 
     if ratio_n is None:
-        ratio_n = 1
+        ratio_n = 2
 
     # Have shape as M but for upsampling part I want shape as M0 distrubited on block_m
     constraints: list[tkw.Constraint] = []
@@ -209,7 +209,7 @@ def get_transponse_conv2d(
         tkw.HardwareConstraint(
             threads_per_wave=64,
             waves_per_block=(ratio_n, ratio_m, 1),
-            vector_shapes={N: 1, H: 1, W: 1, C: 1}
+            vector_shapes={N: 16, H: 16, W: 16, C: 16}
         )
     ]
 
@@ -224,10 +224,10 @@ def get_transponse_conv2d(
         tkw.set_symbol(STRIDE_H, slice_stride_h)
         tkw.set_symbol(STRIDE_W, slice_stride_w)
         # need to use memory to store x
-        #shape = (M0, N)
+        
         shape = (N, C, H_UP, W_UP)
         x_up_zeros_reg = tkl.Register[M0, N, input_dtype](0.0)
-
+        shape = (M0, N)
         # Allocate memory with 0's
         x_up_zeros = allocate(shape, distributed_shape=(BLOCK_M, BLOCK_N), dtype=input_dtype, address_space=mem_space)
         # write 0 reg to memory
@@ -246,7 +246,7 @@ def get_transponse_conv2d(
             acc: tkl.Register[M, NF, output_dtype],
         ) -> tkl.Register[M, NF, output_dtype]:
             a_reg = tkw.read(
-                x_up_zeros,
+                x_raw,
                 mapping=conv_x_mapping,
                 elements_per_thread=ELEMS_PER_THREAD,
             )
@@ -273,8 +273,8 @@ def get_transponse_conv2d(
         HF: hf,
         H_FLIP: h,
         W_FLIP: w,
-        # H_OUT_UPSAMP: h * slice_stride_h,
-        # W_OUT_UPSAMP: w * slice_stride_w,
+        H_UP: h * slice_stride_h,
+        W_UP: w * slice_stride_w,
         STRIDE_H: slice_stride_h,
         STRIDE_W: slice_stride_w,
         BLOCK_M: block_m,
@@ -306,9 +306,9 @@ def upsample_with_zeros(x, stride_h, stride_w):
 import torch.nn.functional as F
 
 if __name__ == "__main__":
-    n, h, w, c = 1, 2, 2, 1
+    n, h, w, c = 1, 4, 4, 1
     nf, hf, wf, cf = 1, 2, 2, 1
-    slice_stride_h, slice_stride_w = 1, 1
+    slice_stride_h, slice_stride_w = 2, 1
     padding = 0
     output_padding = 0
 
@@ -321,7 +321,7 @@ if __name__ == "__main__":
     we_flipped = torch.flip(we, dims=[2, 3])
     # out_ref = torch.nn.Conv2d(x_up, we_flipped, padding=padding)
     convRef = torch.nn.Conv2d(c, nf, hf, stride=1, padding=padding, bias=False)
-    convRef.weight = torch.nn.Parameter(we)
+    convRef.weight = torch.nn.Parameter(we_flipped)
     out_ref = convRef(x_up).detach().to(torch.float32)
 
 
