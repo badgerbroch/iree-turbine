@@ -184,9 +184,9 @@ def get_transponse_conv2d(
         tkw.set_symbol(STRIDE_W, upsamp_stride_w)
         shape = (N, C, H_UP, W_UP)
         #shape = (M0, N)
-        x_up_zeros_reg = tkl.Register[M0, N, input_dtype](0.0)
+        x_up_zeros_reg = tkl.Register[H, C, H_UP, W_UP, input_dtype](0.0)
 
-        x_up_zeros = allocate(shape, distributed_shape=(BLOCK_M, BLOCK_N), dtype=input_dtype, address_space=mem_space)
+        x_up_zeros = allocate(shape, distributed_shape=(H, C, H_UP, W_UP), dtype=input_dtype, address_space=mem_space)
         
         tkw.write(x_up_zeros_reg, x_up_zeros)
         x_input = tkw.read(x)
