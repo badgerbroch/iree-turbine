@@ -24,13 +24,7 @@ from iree.turbine.kernel.wave.utils.run_utils import (
 )
 from iree.turbine.kernel.wave import allocate
 
-from iree.turbine.kernel.wave.utils.torch_utils import (
-    device_randint,
-    device_randn,
-    device_randperm,
-    device_zeros,
-    to_default_device,
-)
+from iree.turbine.kernel.wave.utils.torch_utils import device_randn
 import torch
 
 def get_transponse_conv2d(
@@ -62,8 +56,8 @@ def get_transponse_conv2d(
     N, C, H, W = sym.N, sym.C, sym.H, sym.W
     NF, HF, WF = sym.NF, sym.HF, sym.WF
 
-    H = H * upsamp_stride_h
-    W = W * upsamp_stride_w
+    H_UP = H * upsamp_stride_h
+    W_UP = W * upsamp_stride_w
 
     STRIDE_H, STRIDE_W = tkl.sym.STRIDE_H, tkl.sym.STRIDE_W
 
@@ -73,26 +67,24 @@ def get_transponse_conv2d(
 
     K = HF * WF * C
     M = SZ_OUT * N
-    # Shape for upsampling to be distrubited on block_m and block_n
-    M0 = STRIDE_H * H * STRIDE_W * W * N
 
     i = tkw.IndexMapping.iterator(0)
     j = tkw.IndexMapping.iterator(1)
     k = tkw.IndexMapping.iterator(2)
     l = tkw.IndexMapping.iterator(3)
 
+    # spreads out tensor by STRIDE_H and STRIDE_W
     upsamp_mapping = tkw.IndexMapping(
         num_iterators=4,
         inputs={N: i, C: j, H: k, W: l},
         outputs={
             N: i,
             C: j,
-            H: k * STRIDE_H,
-            W: l * STRIDE_W,
+            H_UP: k * STRIDE_H,
+            W_UP: l * STRIDE_W,
         },
     )
-
-    # Align C dim reading pattern to be contiguous for nhwc_hwcf pattern.
+    # Uses im2col method for flattening 4D to 2D matrix for efficent MM
     x_mapping = tkw.IndexMapping(
         num_iterators=2,
         inputs={
@@ -103,6 +95,7 @@ def get_transponse_conv2d(
         },
         outputs={M: i, K: j},
     )
+    # Flips weight matrix across spatial dims in index mapping
     w_mapping = tkw.IndexMapping(
         num_iterators=2,
         inputs={
@@ -145,23 +138,22 @@ def get_transponse_conv2d(
         raise ValueError(f"Unsupported layout: {layout}")
 
     if block_m is None:
-        block_m = 16
+        block_m = 64
 
     if block_n is None:
-        block_n = 16
+        block_n = 128
 
     if block_k is None:
-        block_k = 16
+        block_k = 32
 
     if ratio_m is None:
-        ratio_m = 1
+        ratio_m = 2
 
     if ratio_n is None:
-        ratio_n = 1
+        ratio_n = 2
 
     # Expose user-constraints
     constraints: list[tkw.Constraint] = []
-    constraints += [tkw.WorkgroupConstraint(M0, BLOCK_M, 1, primary=False)]
     constraints += [tkw.WorkgroupConstraint(M, BLOCK_M, 1)]
     constraints += [tkw.WorkgroupConstraint(NF, BLOCK_N, 0)]
     constraints += [tkw.WaveConstraint(M, BLOCK_M / ratio_m)]
@@ -184,16 +176,13 @@ def get_transponse_conv2d(
         upsamp_stride_h: tkl.i32,
         upsamp_stride_w: tkl.i32,
         out: out_type,
-
-
     ):
         tkw.set_symbol(STRIDE_H, upsamp_stride_h)
         tkw.set_symbol(STRIDE_W, upsamp_stride_w)
-        shape = (N, C, H, W)
-        #shape = (M0, N)
-        x_up_zeros_reg = tkl.Register[N, C, H, W, input_dtype](0.0)
+        shape = (N, C, H_UP, W_UP)
+        x_up_zeros_reg = tkl.Register[N, C, H_UP, W_UP, input_dtype](0.0)
 
-        x_up_zeros = allocate(shape, distributed_shape=(N, C, H, W), dtype=input_dtype, address_space=mem_space)
+        x_up_zeros = allocate(shape, distributed_shape=(N, C, H_UP, W_UP), dtype=input_dtype, address_space=mem_space)
         
         tkw.write(x_up_zeros_reg, x_up_zeros)
         x_input = tkw.read(x)
@@ -257,14 +246,16 @@ def upsample_with_zeros(x, stride_h, stride_w):
 
 
 if __name__ == "__main__":
-    n, h, w, c = 1, 4, 4, 1
-    nf, hf, wf, cf = 1, 2, 2, 1
+    use_random = True
+    print_asm = False
+    n, h, w, c = 3, 5, 5, 3
+    nf, hf, wf, cf = 1, 2, 2, 3
     upsamp_stride_h, upsamp_stride_w = 1, 1
     padding = 0
     output_padding = 0
 
     # Input and filter
-    use_random = True
+    
     x = device_randn(n, c, h, w, dtype=torch.float16)
     we = device_randn(nf, cf, hf, wf, dtype=torch.float16)
     if not use_random:
@@ -314,7 +305,8 @@ if __name__ == "__main__":
     )
     options = set_default_run_config(options)
     trans_conv = wave_compile(options, trans_conv)
-    print(trans_conv.asm)
+    if print_asm:
+        print(trans_conv.asm)
 
     out = torch.zeros_like(out_ref)
     trans_conv(x, we, upsamp_stride_h, upsamp_stride_w, out)
