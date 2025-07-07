@@ -47,7 +47,7 @@ def get_transponse_conv2d(
     conv_stride: int,
     input_dtype: DataType,
     output_dtype: DataType,
-    mem_space: tkl.IndexSymbol = SHARED_ADDRESS_SPACE,
+    mem_space: tkl.IndexSymbol = GLOBAL_ADDRESS_SPACE,
     block_m: Optional[int] = None,
     block_n: Optional[int] = None,
     block_k: Optional[int] = None,
@@ -62,8 +62,8 @@ def get_transponse_conv2d(
     N, C, H, W = sym.N, sym.C, sym.H, sym.W
     NF, HF, WF = sym.NF, sym.HF, sym.WF
 
-    H_UP = H * upsamp_stride_h
-    W_UP = W * upsamp_stride_w
+    H = H * upsamp_stride_h
+    W = W * upsamp_stride_w
 
     STRIDE_H, STRIDE_W = tkl.sym.STRIDE_H, tkl.sym.STRIDE_W
 
@@ -87,8 +87,8 @@ def get_transponse_conv2d(
         outputs={
             N: i,
             C: j,
-            H_UP: k * STRIDE_H,
-            W_UP: l * STRIDE_W,
+            H: k * STRIDE_H,
+            W: l * STRIDE_W,
         },
     )
 
@@ -98,14 +98,18 @@ def get_transponse_conv2d(
         inputs={
             N: i // SZ_OUT,
             C: j % C,
-            H_UP: (i % SZ_OUT) % W_OUT * conv_stride + (j // C) % WF,
-            W_UP: (i % SZ_OUT) // W_OUT * conv_stride + (j // C) // WF,
+            H: (i % SZ_OUT) % W_OUT * conv_stride + (j // C) % WF,
+            W: (i % SZ_OUT) // W_OUT * conv_stride + (j // C) // WF,
         },
         outputs={M: i, K: j},
     )
     w_mapping = tkw.IndexMapping(
         num_iterators=2,
-        inputs={NF: i % NF, C: j % C, HF: HF - 1 - (j // C) % WF, WF: WF - 1 - (j // C) // WF},
+        inputs={
+            NF: i % NF, 
+            C: j % C, 
+            HF: HF - 1 - (j // C) % WF, 
+            WF: WF - 1 - (j // C) // WF},
         outputs={NF: i, K: j},
     )
     out_mapping = tkw.IndexMapping(
@@ -118,6 +122,7 @@ def get_transponse_conv2d(
             W_OUT: (i % SZ_OUT) // W_OUT,
         },
     )
+
 
     # Workgroup tile sizes
     BLOCK_M = tkl.sym.BLOCK_M
@@ -140,19 +145,19 @@ def get_transponse_conv2d(
         raise ValueError(f"Unsupported layout: {layout}")
 
     if block_m is None:
-        block_m = 64
+        block_m = 16
 
     if block_n is None:
-        block_n = 128
+        block_n = 16
 
     if block_k is None:
-        block_k = 32
+        block_k = 16
 
     if ratio_m is None:
-        ratio_m = 2
+        ratio_m = 1
 
     if ratio_n is None:
-        ratio_n = 2
+        ratio_n = 1
 
     # Expose user-constraints
     constraints: list[tkw.Constraint] = []
@@ -179,18 +184,20 @@ def get_transponse_conv2d(
         upsamp_stride_h: tkl.i32,
         upsamp_stride_w: tkl.i32,
         out: out_type,
+
+
     ):
         tkw.set_symbol(STRIDE_H, upsamp_stride_h)
         tkw.set_symbol(STRIDE_W, upsamp_stride_w)
-        shape = (N, C, H_UP, W_UP)
+        shape = (N, C, H, W)
         #shape = (M0, N)
-        x_up_zeros_reg = tkl.Register[H, C, H_UP, W_UP, input_dtype](0.0)
+        x_up_zeros_reg = tkl.Register[N, C, H, W, input_dtype](0.0)
 
-        x_up_zeros = allocate(shape, distributed_shape=(H, C, H_UP, W_UP), dtype=input_dtype, address_space=mem_space)
+        x_up_zeros = allocate(shape, distributed_shape=(N, C, H, W), dtype=input_dtype, address_space=mem_space)
         
         tkw.write(x_up_zeros_reg, x_up_zeros)
         x_input = tkw.read(x)
-        tkw.write(x_input, x_up_zeros, elements_per_thread=ELEMS_PER_THREAD, mapping=upsamp_mapping)
+        tkw.write(x_input, x_up_zeros, mapping=upsamp_mapping)
 
         c_reg = tkl.Register[M, NF, output_dtype](0.0)
 
@@ -227,7 +234,7 @@ def get_transponse_conv2d(
         BLOCK_N: block_n,
         BLOCK_K: block_k,
         ELEMS_PER_THREAD: 4,
-        ADDRESS_SPACE: mem_space,
+        ADDRESS_SPACE: GLOBAL_ADDRESS_SPACE,
     }
 
     return conv, symbols
@@ -257,8 +264,12 @@ if __name__ == "__main__":
     output_padding = 0
 
     # Input and filter
+    use_random = True
     x = device_randn(n, c, h, w, dtype=torch.float16)
     we = device_randn(nf, cf, hf, wf, dtype=torch.float16)
+    if not use_random:
+        x = x.fill_(1.0)
+        we = we.fill_(0.25)
     we_flipped = torch.flip(we, dims=[2, 3])
     # Reference manual transposed conv
     x_up = upsample_with_zeros(x, upsamp_stride_h, upsamp_stride_w)
@@ -303,6 +314,7 @@ if __name__ == "__main__":
     )
     options = set_default_run_config(options)
     trans_conv = wave_compile(options, trans_conv)
+    print(trans_conv.asm)
 
     out = torch.zeros_like(out_ref)
     trans_conv(x, we, upsamp_stride_h, upsamp_stride_w, out)
