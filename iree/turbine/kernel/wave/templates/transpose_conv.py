@@ -27,7 +27,7 @@ from iree.turbine.kernel.wave import allocate
 from iree.turbine.kernel.wave.utils.torch_utils import device_randn
 import torch
 
-def get_transponse_conv2d(
+def get_transpose_conv2d(
     layout: str,
     n: int,
     h: int,
@@ -67,6 +67,7 @@ def get_transponse_conv2d(
 
     K = HF * WF * C
     M = SZ_OUT * N
+    M0 = H_UP * W_UP * N
 
     i = tkw.IndexMapping.iterator(0)
     j = tkw.IndexMapping.iterator(1)
@@ -154,6 +155,8 @@ def get_transponse_conv2d(
 
     # Expose user-constraints
     constraints: list[tkw.Constraint] = []
+    #constraints += [tkw.WorkgroupConstraint(M0, BLOCK_M, 1, primary=False)]
+
     constraints += [tkw.WorkgroupConstraint(M, BLOCK_M, 1)]
     constraints += [tkw.WorkgroupConstraint(NF, BLOCK_N, 0)]
     constraints += [tkw.WaveConstraint(M, BLOCK_M / ratio_m)]
@@ -163,7 +166,7 @@ def get_transponse_conv2d(
     constraints += [
         tkw.HardwareConstraint(
             threads_per_wave=64,
-            waves_per_block=(ratio_n, ratio_m, 1),
+            waves_per_block=(ratio_m, ratio_n, 1),
             vector_shapes={N: 1, H: 1, W: 1, C: 1}
 
         )
@@ -177,15 +180,16 @@ def get_transponse_conv2d(
         upsamp_stride_w: tkl.i32,
         out: out_type,
     ):
+        x_input = tkw.read(x)
         tkw.set_symbol(STRIDE_H, upsamp_stride_h)
         tkw.set_symbol(STRIDE_W, upsamp_stride_w)
         shape = (N, C, H_UP, W_UP)
         x_up_zeros_reg = tkl.Register[N, C, H_UP, W_UP, input_dtype](0.0)
 
-        x_up_zeros = allocate(shape, distributed_shape=(N, C, H_UP, W_UP), dtype=input_dtype, address_space=mem_space)
-        
-        tkw.write(x_up_zeros_reg, x_up_zeros)
-        x_input = tkw.read(x)
+        x_up_zeros = allocate(shape, distributed_shape=(N, C, H_UP, W_UP), dtype=input_dtype, address_space=GLOBAL_ADDRESS_SPACE)
+        # Write 0's to allocated memory
+        tkw.write(x_up_zeros_reg, x_up_zeros)        
+        # Write matrix to allocated memory with upsample mapping
         tkw.write(x_input, x_up_zeros, mapping=upsamp_mapping)
 
         c_reg = tkl.Register[M, NF, output_dtype](0.0)
@@ -248,9 +252,10 @@ def upsample_with_zeros(x, stride_h, stride_w):
 if __name__ == "__main__":
     use_random = True
     print_asm = False
-    n, h, w, c = 3, 5, 5, 3
-    nf, hf, wf, cf = 1, 2, 2, 3
-    upsamp_stride_h, upsamp_stride_w = 1, 1
+    n, h, w, c = 1, 12, 12, 3
+    nf, hf, wf = 1, 2, 2
+    cf = c
+    upsamp_stride_h, upsamp_stride_w = 2, 2
     padding = 0
     output_padding = 0
 
@@ -282,7 +287,7 @@ if __name__ == "__main__":
     else:
         raise ValueError(f"Invalid layout: {layout}")
     # Get compiled IREE kernel
-    trans_conv, hyperparams = get_transponse_conv2d(
+    trans_conv, hyperparams = get_transpose_conv2d(
         layout=layout,
         n=n,
         h=h,
@@ -304,7 +309,9 @@ if __name__ == "__main__":
         wave_runtime=True,
     )
     options = set_default_run_config(options)
+    print("Compiling Kernel...")
     trans_conv = wave_compile(options, trans_conv)
+    print("Kernel Compiled")
     if print_asm:
         print(trans_conv.asm)
 
@@ -314,10 +321,13 @@ if __name__ == "__main__":
     # Print results
     print("Input (x):")
     print(x[0, 0])
-    print("\nUpsampled Input:")
+    if upsamp_stride_h > 1:
+        print("\nUpsampled Input:")
     print(x_up[0, 0])
     print("\nWeight:")
     print(we[0, 0])
+    print("\nWeight Flipped:")
+    print(we_flipped[0, 0])
  
     print("\nManual Transposed Convolution Output:")
     print(out_ref)
@@ -326,3 +336,4 @@ if __name__ == "__main__":
     print(out.shape)
 
     assert_close(out, out_ref, rtol=1e-03, atol=1e-03)
+    print("\nResults are the Same")
